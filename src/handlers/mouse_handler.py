@@ -6,18 +6,30 @@ class MouseHandler:
     """Handles mouse events for 3D scene interaction."""
     
     def __init__(self, scene_widget, coord_callback, status_callback, 
-                 marker_callback):
+                 marker_callback, move_callback=None):
         self.scene_widget = scene_widget
         self.coord_callback = coord_callback
         self.status_callback = status_callback
         self.marker_callback = marker_callback
+        self.move_callback = move_callback
+        self.move_mode = False
+    
+    def set_move_mode(self, enabled: bool):
+        """Enable or disable move mode."""
+        self.move_mode = enabled
     
     def handle_mouse_event(self, event):
-        """Process mouse events for Shift+Click picking."""
+        """Process mouse events for Shift+Click picking and move mode."""
         if event.type == gui.MouseEvent.Type.BUTTON_DOWN:
             if event.is_modifier_down(gui.KeyModifier.SHIFT):
-                self._handle_shift_click(event.x, event.y)
-                return gui.Widget.EventCallbackResult.HANDLED
+                # In move mode, Shift+Click moves selected tag
+                if self.move_mode and self.move_callback:
+                    self._handle_move_click(event.x, event.y)
+                    return gui.Widget.EventCallbackResult.HANDLED
+                # Normal mode: Shift+Click for new tag placement
+                elif not self.move_mode:
+                    self._handle_shift_click(event.x, event.y)
+                    return gui.Widget.EventCallbackResult.HANDLED
         
         return gui.Widget.EventCallbackResult.IGNORED
     
@@ -45,5 +57,25 @@ class MouseHandler:
                         [0.2, 0.8, 0.3]
                     )
                     self.marker_callback(world_point)
+        
+        self.scene_widget.scene.scene.render_to_depth_image(depth_callback)
+    
+    def _handle_move_click(self, x: int, y: int):
+        """Handle Shift+Click in move mode to relocate selected tag."""
+        def depth_callback(depth_image):
+            depth = np.asarray(depth_image)
+            if y < depth.shape[0] and x < depth.shape[1]:
+                depth_value = depth[y, x]
+                if depth_value < 1.0:
+                    widget = self.scene_widget
+                    world_point = widget.scene.camera.unproject(
+                        x, y, depth_value,
+                        widget.frame.width,
+                        widget.frame.height
+                    )
+                    
+                    # Call move callback with new coordinates
+                    if self.move_callback:
+                        self.move_callback(world_point)
         
         self.scene_widget.scene.scene.render_to_depth_image(depth_callback)

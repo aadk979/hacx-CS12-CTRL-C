@@ -60,3 +60,12 @@ class TagManager:
     def get_tag_by_id(self, tag_id: str) -> Tag:
         """Retrieve tag by ID."""
         return next((t for t in self.tags if t.id == tag_id), None)
+    
+    def update_tag_coords(self, tag_id: str, new_coords: List[float]) -> bool:
+        """Update coordinates of an existing tag."""
+        tag = self.get_tag_by_id(tag_id)
+        if tag:
+            tag.coords = new_coords
+            self.save()
+            return True
+        return False

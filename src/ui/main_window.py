@@ -25,6 +25,9 @@ class MainWindow:
         self.pcd_manager = PointCloudManager()
         self.tag_manager = TagManager()
         self.selected_tag_id = None
+        self.move_mode = False
+        self.mouse_handler = None
+        self.shift_pressed = False  # Track shift key state manually
         
         # UI Panels
         self.coord_panel = None
@@ -33,6 +36,7 @@ class MainWindow:
         self.status_label = None
         self.stats_label = None
         self.tag_list = None
+        self.move_mode_label = None
     
     def initialize(self):
         """Initialize the application window."""
@@ -59,10 +63,14 @@ class MainWindow:
         # Layout
         self._setup_layout(main_panel)
         
+        # Setup window-level keyboard handler (backup)
+        self.window.set_on_key(self._on_key_event)
+        
         # Add existing tags to scene
         self._render_existing_tags()
         
         print("✅ Application ready. Shift+Click to tag points in 3D space.")
+        print("   Press Shift+M or click 'Toggle Move Mode' button to move tags.")
     
     def _create_main_panel(self, em: float) -> gui.Vert:
         """Create the main control panel."""
@@ -80,6 +88,11 @@ class MainWindow:
         )
         self.status_label.text_color = gui.Color(0.3, 0.6, 0.9)
         panel.add_child(self.status_label)
+        
+        # Move mode indicator
+        self.move_mode_label = gui.Label("")
+        self.move_mode_label.text_color = gui.Color(1.0, 0.5, 0.0)
+        panel.add_child(self.move_mode_label)
         panel.add_fixed(em * 0.75)
         
         # Panels
@@ -108,6 +121,12 @@ class MainWindow:
         panel.add_child(button_row)
         panel.add_fixed(em * 0.5)
         
+        # Move mode toggle button
+        move_mode_btn = gui.Button("🔧 Toggle Move Mode (Shift+M)")
+        move_mode_btn.set_on_clicked(self._toggle_move_mode)
+        panel.add_child(move_mode_btn)
+        panel.add_fixed(em * 0.5)
+        
         # Export button
         export_btn = gui.Button("📦 Export Cloud + Tags")
         export_btn.set_on_clicked(self._on_export)
@@ -116,10 +135,14 @@ class MainWindow:
         
         # Tag list
         list_section = gui.CollapsableVert(
-            "📋 Existing Tags",
+            "📋 Existing Tags (Click to Select)",
             em * 0.5,
             gui.Margins(em * 0.5, 0, 0, 0)
         )
+        list_help = gui.Label("💡 Click a tag to select it, then use Shift+M to move")
+        list_help.text_color = gui.Color(0.5, 0.5, 0.5)
+        list_section.add_child(list_help)
+        list_section.add_fixed(em * 0.3)
         self.tag_list = gui.ListView()
         self.tag_list.set_on_selection_changed(self._on_tag_selected)
         self._update_tag_list()
@@ -143,6 +166,9 @@ class MainWindow:
         )
         help_text = (
             "• Shift+Click: Pick 3D point\n"
+            "• Click tag in list: Select tag\n"
+            "• Shift+M: Toggle move mode\n"
+            "• In move mode: Shift+Click to move tag\n"
             "• Upload: Add multiple photos\n"
             "• Save: Store tag permanently\n"
             "• Export: Create PLY with tags"
@@ -163,13 +189,17 @@ class MainWindow:
         widget.scene.set_background(config.BACKGROUND_COLOR)
         
         # Setup mouse handler
-        mouse_handler = MouseHandler(
+        self.mouse_handler = MouseHandler(
             widget,
             self.coord_panel.set_coordinates,
             self._update_status,
-            self._show_temp_marker
+            self._show_temp_marker,
+            self._on_move_tag
         )
-        widget.set_on_mouse(mouse_handler.handle_mouse_event)
+        widget.set_on_mouse(self.mouse_handler.handle_mouse_event)
+        
+        # Note: Keyboard handler is set on window level in initialize()
+        # to catch events regardless of widget focus
         
         # Add point cloud
         mat = rendering.MaterialRecord()
@@ -270,11 +300,7 @@ class MainWindow:
             self.tag_manager.add_tag(tag)
             
             # Add to scene
-            marker, _ = GeometryUtils.create_marker(coords, tag_color)
-            mat = rendering.MaterialRecord()
-            mat.shader = "defaultLit"
-            mat.base_color = tag_color + [1]
-            self.scene_widget.scene.add_geometry(f"tag_{tag.id}", marker, mat)
+            self._render_tag(tag)
             
             # Remove temp marker
             if self.scene_widget.scene.has_geometry("temp_marker"):
@@ -292,6 +318,10 @@ class MainWindow:
             self.coord_panel.set_coordinates("0.000, 0.000, 0.000")
             self.photo_panel.clear()
             self._update_tag_list()
+            
+            # Select the newly created tag
+            self.selected_tag_id = tag.id
+            self._highlight_selected_tag()
             
         except Exception as e:
             self._update_status(f"❌ Error: {e}", [0.9, 0.2, 0.2])
@@ -318,8 +348,21 @@ class MainWindow:
         
         self._update_status(f"🗑️ Deleted '{tag.title}'", [0.8, 0.4, 0.2])
         self.stats_label.text = f"📊 Total Tags: {len(self.tag_manager.tags)}"
+        
+        # Clear selection and move mode if deleted tag was selected
+        deleted_tag_id = self.selected_tag_id
         self.selected_tag_id = None
+        if self.move_mode:
+            self.move_mode = False
+            if self.mouse_handler:
+                self.mouse_handler.set_move_mode(False)
+            self.move_mode_label.text = ""
+        
         self._update_tag_list()
+        
+        # Re-render all tags to remove highlights
+        for t in self.tag_manager.tags:
+            self._render_tag(t)
     
     def _on_export(self):
         """Handle export action."""
@@ -367,11 +410,46 @@ class MainWindow:
             self._update_status(f"❌ Export failed: {e}", [0.9, 0.2, 0.2])
     
     def _on_tag_selected(self, new_val, is_double_click):
-        """Handle tag selection from list."""
-        if 0 <= new_val < len(self.tag_manager.tags):
-            tag = self.tag_manager.tags[new_val]
-            self.selected_tag_id = tag.id
-            self._update_status(f"🔍 Selected: {tag.title}", [0.3, 0.6, 0.9])
+        """Handle tag selection from list.
+        
+        Args:
+            new_val: The selected item text (string) from the list
+            is_double_click: Whether it was a double-click
+        """
+        try:
+            # new_val is the item text, not an index
+            # Find the tag by matching the list item text
+            if not new_val or new_val == "":
+                return
+            
+            # Find the tag that matches this list item text
+            tag = None
+            for t in self.tag_manager.tags:
+                # Match the format used in _update_tag_list
+                item_text = f"{t.title} - ({', '.join(f'{c:.2f}' for c in t.coords)})"
+                if item_text == new_val:
+                    tag = t
+                    break
+            
+            if tag:
+                self.selected_tag_id = tag.id
+                self._update_status(
+                    f"🔍 Selected: {tag.title} - Press Shift+M or click 'Toggle Move Mode' to move it",
+                    [0.3, 0.6, 0.9]
+                )
+                # Update coordinate panel with selected tag coordinates
+                coord_str = f"{tag.coords[0]:.3f}, {tag.coords[1]:.3f}, {tag.coords[2]:.3f}"
+                self.coord_panel.set_coordinates(coord_str)
+                # Highlight selected tag
+                self._highlight_selected_tag()
+                
+                # If move mode is already on, update the move mode label
+                if self.move_mode:
+                    self.move_mode_label.text = f"🔧 MOVE MODE: {tag.title}"
+        except Exception as e:
+            print(f"❌ Error selecting tag: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _update_tag_list(self):
         """Update the tag list widget."""
@@ -384,15 +462,142 @@ class MainWindow:
     def _render_existing_tags(self):
         """Add existing tags to the scene."""
         for tag in self.tag_manager.tags:
-            tag_dict = tag.to_dict()
-            marker, _ = GeometryUtils.create_marker(
-                tag_dict["coords"],
-                tag_dict.get("color")
+            self._render_tag(tag)
+    
+    def _render_tag(self, tag: Tag, highlight: bool = False):
+        """Render a single tag marker in the scene."""
+        tag_dict = tag.to_dict()
+        color = tag_dict.get("color", [1, 0, 0])
+        
+        # Highlight selected tag with brighter/larger marker
+        if highlight:
+            radius = config.MARKER_RADIUS * 1.3
+            # Make color brighter
+            color = [min(1.0, c * 1.3) for c in color]
+        else:
+            radius = config.MARKER_RADIUS
+        
+        marker, _ = GeometryUtils.create_marker(
+            tag_dict["coords"],
+            color,
+            radius
+        )
+        mat = rendering.MaterialRecord()
+        mat.shader = "defaultLit"
+        mat.base_color = color + [1]
+        
+        geometry_name = f"tag_{tag.id}"
+        if self.scene_widget.scene.has_geometry(geometry_name):
+            self.scene_widget.scene.remove_geometry(geometry_name)
+        
+        self.scene_widget.scene.add_geometry(geometry_name, marker, mat)
+    
+    def _highlight_selected_tag(self):
+        """Update tag rendering to highlight selected tag."""
+        for tag in self.tag_manager.tags:
+            is_selected = tag.id == self.selected_tag_id
+            self._render_tag(tag, highlight=is_selected)
+    
+    def _on_key_event(self, event):
+        """Handle keyboard events.
+        
+        Returns:
+            bool: True to stop event propagation, False to allow normal processing
+        """
+        # Track shift key state
+        if event.key == gui.KeyName.LEFT_SHIFT or event.key == gui.KeyName.RIGHT_SHIFT:
+            if event.type == gui.KeyEvent.Type.DOWN:
+                self.shift_pressed = True
+            elif event.type == gui.KeyEvent.Type.UP:
+                self.shift_pressed = False
+            # Don't consume shift key events - allow normal processing
+            return False
+        
+        # Check for Shift+M to toggle move mode
+        if event.type == gui.KeyEvent.Type.DOWN:
+            if event.key == gui.KeyName.M and self.shift_pressed:
+                self._toggle_move_mode()
+                # Consume this event to prevent further processing
+                return True
+        
+        # Allow other key events to be processed normally
+        return False
+    
+    def _toggle_move_mode(self):
+        """Toggle move mode on/off."""
+        # If currently in move mode, turn it off
+        if self.move_mode:
+            self.move_mode = False
+            if self.mouse_handler:
+                self.mouse_handler.set_move_mode(False)
+            self.move_mode_label.text = ""
+            self._update_status(
+                "✨ Move mode OFF. Shift+Click to pick new points.",
+                [0.3, 0.6, 0.9]
             )
-            mat = rendering.MaterialRecord()
-            mat.shader = "defaultLit"
-            mat.base_color = tag_dict.get("color", [1, 0, 0]) + [1]
-            self.scene_widget.scene.add_geometry(f"tag_{tag.id}", marker, mat)
+            # Re-highlight selected tag without move mode styling
+            if self.selected_tag_id:
+                self._highlight_selected_tag()
+        else:
+            # Try to turn move mode on - requires a selected tag
+            if not self.selected_tag_id:
+                self._update_status(
+                    "⚠️ Select a tag from the list first, then press Shift+M",
+                    [0.9, 0.5, 0.2]
+                )
+                return
+            
+            tag = self.tag_manager.get_tag_by_id(self.selected_tag_id)
+            if not tag:
+                self._update_status(
+                    "⚠️ Selected tag not found",
+                    [0.9, 0.5, 0.2]
+                )
+                return
+            
+            # Enable move mode
+            self.move_mode = True
+            if self.mouse_handler:
+                self.mouse_handler.set_move_mode(True)
+            self.move_mode_label.text = f"🔧 MOVE MODE: {tag.title}"
+            self._update_status(
+                f"🔧 Move mode ON. Shift+Click to move '{tag.title}' to new location",
+                [1.0, 0.6, 0.0]
+            )
+            # Highlight selected tag
+            self._highlight_selected_tag()
+    
+    def _on_move_tag(self, new_coords):
+        """Handle tag movement to new coordinates."""
+        if not self.move_mode or not self.selected_tag_id:
+            return
+        
+        tag = self.tag_manager.get_tag_by_id(self.selected_tag_id)
+        if not tag:
+            self._update_status("❌ Tag not found", [0.9, 0.2, 0.2])
+            return
+        
+        # Update tag coordinates
+        new_coords_list = [float(new_coords[0]), float(new_coords[1]), float(new_coords[2])]
+        success = self.tag_manager.update_tag_coords(self.selected_tag_id, new_coords_list)
+        
+        if success:
+            # Update coordinate panel
+            coord_str = f"{new_coords_list[0]:.3f}, {new_coords_list[1]:.3f}, {new_coords_list[2]:.3f}"
+            self.coord_panel.set_coordinates(coord_str)
+            
+            # Update tag rendering
+            self._render_tag(tag, highlight=True)
+            
+            # Update tag list
+            self._update_tag_list()
+            
+            self._update_status(
+                f"✅ Moved '{tag.title}' to ({coord_str})",
+                [0.2, 0.8, 0.3]
+            )
+        else:
+            self._update_status("❌ Failed to move tag", [0.9, 0.2, 0.2])
     
     def run(self):
         """Run the application."""
